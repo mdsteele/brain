@@ -1,0 +1,30 @@
+Brain is a console-based to-do list program, with a pithy command language that
+makes it very quick to, for example:
+
+  - Create new to-do tasks
+  - Specify that task A depends on task B, supporting arbitrary DAG structures
+  - Specify that a task requires some particular context (e.g. I need to have
+    internet for some task)
+  - Specify that context A is a subcontext of B (e.g. if I'm at home, I have
+    internet)
+  - Query what tasks I could do right now, given that I'm currently e.g. at
+    home
+  - Query what I need to do each day for the next week and in what order,
+    taking into account due dates and dependencies
+
+...and a bunch of other things.  There are, of course, already a thousand other
+to-do list programs in the world; I like this one mainly because it's light
+weight, and because I wrote it and can thus easily add new things to it
+whenever I think of them.  I wrote this program with only myself in mind, but
+perhaps someone else will find it useful or interesting.
+
+This codebase is licensed under the GNU GPL, version 3.  This codebase is free
+software: you can redistribute it and/or modify it under the terms of the GNU
+General Public License as published by the Free Software Foundation, either
+version 3 of the License, or (at your option) any later version.
+
+Brain is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+
+The complete license can be found in the LICENSE file.

@@ -1,0 +1,1452 @@
+#!/usr/bin/env python2.6
+# -*- Python -*-
+
+#=============================================================================#
+# Copyright 2009 Matthew D. Steele <mdsteele@alum.mit.edu>                    #
+#                                                                             #
+# This program is free software: you can redistribute it and/or modify it     #
+# under the terms of the GNU General Public License as published by the Free  #
+# Software Foundation, either version 3 of the License, or (at your option)   #
+# any later version.                                                          #
+#                                                                             #
+# This program is distributed in the hope that it will be useful, but WITHOUT #
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or       #
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for   #
+# more details.                                                               #
+#                                                                             #
+# You should have received a copy of the GNU General Public License along     #
+# with this program.  If not, see <http://www.gnu.org/licenses/>.             #
+#=============================================================================#
+
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import with_statement
+
+import collections
+import cPickle as pickle
+import datetime
+import math
+import os
+import random
+import re
+import shutil
+
+#=============================================================================#
+
+DATABASE_DIR = os.path.expanduser('~/.brain')
+DATABASE_DATA = os.path.join(DATABASE_DIR, 'db')
+DATABASE_UNDO = os.path.join(DATABASE_DIR, 'db-undo')
+DATABASE_BACKUP = os.path.join(DATABASE_DIR, 'db-backup')
+
+class BrainError(Exception):
+    pass
+
+class ParseError(Exception):
+    pass
+
+class Quit(Exception):
+    pass
+
+def format_date(date):
+    return ('*' if date is None else date.strftime("%%i-%b-%Y") % date.day)
+
+def date_desc(date):
+    delta = (date - datetime.date.today()).days
+    if delta == 0:
+        return "today"
+    elif delta == -1:
+        return "yesterday"
+    elif -1 > delta:
+        return "%i days ago" % -delta
+    elif delta == 1:
+        return "tomorrow"
+    elif delta > 1:
+        return "%i days from now" % delta
+    else: assert False
+
+def random_ticket(n):
+    """Return a random ticket of length n."""
+    return (random.choice("abcdefghijklmnopqrstuvwxyz") +
+            ''.join(random.choice("0123456789abcdefghijklmnopqrstuvwxyz")
+                    for _ in range(n - 1)))
+
+def ticket_length(size):
+    """Recommend a ticket length given the size of the database."""
+    return max(2, int(math.ceil(math.log(size*2/26 + 1, 36))) + 1)
+
+def linked_list_iter(llist):
+    while llist is not None:
+        car, cdr = llist
+        yield car
+        llist = cdr
+
+#=============================================================================#
+
+class Handler(object):
+
+    def __init__(self, database):
+        self.__db = database
+
+    def run(self):
+        self.startup()
+        while True:
+            try:
+                self.__db.execute_command(self, self.get_command())
+            except Quit:
+                break
+        self.shutdown()
+
+    def startup(self):
+        pass
+
+    def shutdown(self):
+        pass
+
+    def get_command(self):
+        raise NotImplementedError
+
+    def display(self, text):
+        raise NotImplementedError
+
+    def message(self, message):
+        raise NotImplementedError
+
+    def error(self, message):
+        self.message('Error: ' + message)
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - #
+
+class ConsoleHandler(Handler):
+
+    def startup(self):
+        print
+        self.message("Welcome to Brain.  %s" % random.choice([
+            "How may I serve you?",
+            "Don't panic.",
+            "Out of sight, out of mind.",
+            "Maybe I can help.",
+            "Have patience.",
+            "Don't do anything stupid.",
+            "Everything's going to be okay.",
+            "Relax; I'll take care of it.",
+            ]))
+
+    def shutdown(self):
+        print "\x1b[35mCiao!\x1b[m"
+
+    def get_command(self):
+        try:
+            return raw_input("\x1b[32;1m%\x1b[m ")
+        except (EOFError, KeyboardInterrupt):
+            print
+            raise Quit
+
+    SEPARATOR = '\x1b[34;1m' + '-' * 79 + '\x1b[m'
+
+    def display(self, lines):
+        if lines:
+            print self.SEPARATOR
+            for line in lines:
+                print line
+            print self.SEPARATOR
+
+    def message(self, message):
+        print '\x1b[33m%s\x1b[m' % message
+
+    def error(self, message):
+        print '\x1b[31mError: %s\x1b[m' % message
+
+#=============================================================================#
+
+class Task(object):
+
+    __slots__ = ('ticket', 'desc', 'context', 'due_date', 'start_date',
+                 'depends_on', 'depended_by', 'duration')
+
+    def __init__(self, ticket, desc, context=None,
+                 due_date=None, start_date=None,
+                 depends_on=(), depended_by=(), duration=0):
+        self.ticket = ticket
+        self.desc = desc.strip()
+        self.context = context
+        self.due_date = due_date
+        self.start_date = start_date
+        self.depends_on = set(depends_on)
+        self.depended_by = set(depended_by)
+        self.duration = duration
+
+    def is_doable(self):
+        return (not self.depends_on and
+                (self.start_date is None or
+                 self.start_date <= datetime.date.today()))
+
+    def is_hypothetically_doable(self, tickets, date):
+        return (self.depends_on <= frozenset(tickets) and
+                (self.start_date is None or self.start_date <= date))
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - #
+
+class Context(object):
+
+    __slots__ = ('name', 'tickets', 'subcontexts', 'supercontexts')
+
+    def __init__(self, name, tickets=(), subcontexts=(), supercontexts=()):
+        self.name = name
+        self.tickets = set(tickets)
+        self.subcontexts = set(subcontexts)
+        self.supercontexts = set(supercontexts)
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - #
+
+class Day(object):
+
+    __slots__ = ('date', 'start', 'due')
+
+    def __init__(self, date, start=(), due=()):
+        self.date = date
+        self.start = set(start)
+        self.due = set(due)
+
+#=============================================================================#
+
+class Database(object):
+
+    def execute_command(self, handler, string):
+        try:
+            command = parse_command(string)
+        except ParseError, e:
+            handler.error(str(e))
+            return
+        if command is None:
+            return
+        try:
+            dbs = DatabaseSession(handler)
+            dbs.execute_command(command)
+        except BrainError, e:
+            handler.error(str(e))
+        else:
+            dbs._commit()
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - #
+
+SPECIAL_COMMANDS = {}
+
+def special(*strings):
+    def decorator(f):
+        for string in strings:
+            SPECIAL_COMMANDS[string] = f
+        return f
+    return decorator
+
+class DatabaseSession(object):
+
+    def __init__(self, handler):
+        self.__no_writeback = False
+        self.__change_was_made = False
+        if os.path.isfile(DATABASE_DATA):
+            with file(DATABASE_DATA, 'rb') as f:
+                (self.__tasks, self.__contexts, self.__days) = pickle.load(f)
+        else:
+            self.__tasks = {}
+            self.__contexts = {}
+            self.__days = {}
+        self.__handler = handler
+        self.__display = None
+        self.__messages = []
+
+    def _commit(self):
+        if not self.__no_writeback:
+            if self.__change_was_made:
+                if os.path.isfile(DATABASE_DATA):
+                    shutil.copyfile(DATABASE_DATA, DATABASE_UNDO)
+            with file(DATABASE_DATA, 'wb') as f:
+                pickle.dump((self.__tasks, self.__contexts, self.__days),
+                            f, pickle.HIGHEST_PROTOCOL)
+        if self.__display is not None:
+            self.__handler.display(self.__display)
+            self.__display = None
+        for message in self.__messages:
+            self.__handler.message(message)
+        del self.__messages[:]
+
+    def __msg(self, message):
+        self.__messages.append(message)
+
+    #--------------------------- GET/CREATE/DELETE ---------------------------#
+
+    def __add_task(self, desc):
+        length = ticket_length(len(self.__tasks))
+        ticket = random_ticket(length)
+        while ticket in self.__tasks:
+            ticket = random_ticket(length)
+        task = Task(ticket, desc)
+        self.__tasks[ticket] = task
+        self.__msg("Created task [%s]: %s" % (task.ticket, task.desc))
+        return task
+
+    def __get_task(self, ticket):
+        try:
+            return self.__tasks[ticket]
+        except KeyError:
+            raise BrainError("no such task (%s)" % ticket)
+
+    def __delete_task(self, task):
+        for ticket in task.depends_on:
+            self.__tasks[ticket].depended_by.remove(task.ticket)
+        for ticket in task.depended_by:
+            self.__tasks[ticket].depends_on.remove(task.ticket)
+        if task.context is not None:
+            context = self.__contexts[task.context]
+            context.tickets.remove(task.ticket)
+            self.__clean_context(context)
+        if task.start_date is not None:
+            day = self.__days[task.start_date]
+            day.start.remove(task.ticket)
+            self.__clean_day(day)
+        if task.due_date is not None:
+            day = self.__days[task.due_date]
+            day.due.remove(task.ticket)
+            self.__clean_day(day)
+        del self.__tasks[task.ticket]
+
+    def __get_or_create_context(self, name):
+        assert name is not None
+        try:
+            context = self.__contexts[name]
+        except KeyError:
+            context = Context(name)
+            self.__contexts[name] = context
+        return context
+
+    def __clean_context(self, context):
+        if not (context.tickets or context.subcontexts or
+                context.supercontexts):
+            del self.__contexts[context.name]
+
+    def __delete_context(self, context):
+        for ticket in context.tickets:
+            assert self.__tasks[ticket].context == context.name
+            self.__tasks[ticket].context = None
+        for cname in context.subcontexts:
+            other = self.__contexts[cname]
+            other.supercontexts.remove(context.name)
+            self.__clean_context(other)
+        for cname in context.supercontexts:
+            other = self.__contexts[cname]
+            other.subcontexts.remove(context.name)
+            self.__clean_context(other)
+        del self.__contexts[context.name]
+
+    def __get_or_create_day(self, date):
+        if not isinstance(date, datetime.date):
+            raise TypeError('%r is not a date' % date)
+        try:
+            day = self.__days[date]
+        except KeyError:
+            day = Day(date)
+            self.__days[date] = day
+        return day
+
+    def __clean_day(self, day):
+        assert self.__days[day.date] is day
+        if not (day.start or day.due):
+            del self.__days[day.date]
+
+    #----------------------------- MASS RETRIEVE -----------------------------#
+
+    def __get_tasks(self, items):
+        kind, arg = items
+        if kind == 'SEARCH':
+            return self.__search(arg)
+        else:
+            assert kind == 'ITEMS'
+            tasks = []
+            for ikind, iarg in arg:
+                if ikind == 'TICKET':
+                    tasks.append(self.__get_task(iarg))
+                elif ikind == 'ADD':
+                    tasks.append(self.__add_task(iarg))
+            return tasks
+
+    def __search(self, string):
+        try:
+            regexp = re.compile(string, re.IGNORECASE)
+        except re.error, e:
+            raise BrainError("bad search regexp (%s)" % e)
+        return sorted((task for task in self.__tasks.itervalues()
+                       if regexp.search(task.desc)),
+                      key=(lambda task: task.ticket))
+
+    def __get_prereqs(self, tasks):
+        prereqs = set(tasks)
+        stack = list(prereqs)
+        while stack:
+            next = stack.pop()
+            for ticket in next.depends_on:
+                dep = self.__tasks[ticket]
+                if dep not in prereqs:
+                    prereqs.add(dep)
+                    stack.append(dep)
+        return prereqs
+
+    #-------------------------------- SPECIAL --------------------------------#
+
+    @special('quit', 'exit', 'bye', 'ciao')
+    def __special_quit(self):
+        raise Quit
+
+    @special('cal')
+    def __special_cal(self):
+        self.__display_calendar(7)
+
+    @special('cal2')
+    def __special_cal2(self):
+        self.__display_calendar(14)
+
+    @special('commands')
+    def __special_commands(self):
+        self.__display = sorted(SPECIAL_COMMANDS.iterkeys())
+
+    @special('contexts')
+    def __special_contexts(self):
+        contexts = sorted(self.__contexts.iterkeys())
+        self.__display = []
+        for name, context in sorted(self.__contexts.iteritems()):
+            numtasks = len(context.tickets)
+            numdoable = sum(1 for ticket in context.tickets if
+                            self.__tasks[ticket].is_doable())
+            if numtasks == 0:
+                self.__display.append(name)
+            else:
+                self.__display.append("%s (%i/%i)" %
+                                      (name, numdoable, numtasks))
+
+    @special('count')
+    def __special_count(self):
+        numtasks = len(self.__tasks)
+        numcontexts = len(self.__contexts)
+        self.__msg("The database contains %i task%s and %i context%s."
+                   % (numtasks, ('' if numtasks == 1 else 's'),
+                      numcontexts, ('' if numcontexts == 1 else 's')))
+
+    @special('days')
+    def __special_days(self):
+        self.__display = [format_date(date) for date in
+                          sorted(self.__days.iterkeys())]
+
+    @special('revert')
+    def __special_revert(self):
+        if os.path.isfile(DATABASE_BACKUP):
+            shutil.copyfile(DATABASE_BACKUP, DATABASE_DATA)
+            self.__no_writeback = True
+            self.__msg("Reverted to backup data.")
+        else:
+            raise BrainError('no backup file exists')
+
+    @special('today', 'date')
+    def __special_today(self):
+        self.__msg("Today's date is %s." %
+                   format_date(datetime.date.today()))
+
+    @special('undo')
+    def __special_undo(self):
+        if os.path.isfile(DATABASE_UNDO):
+            shutil.copyfile(DATABASE_UNDO, DATABASE_DATA)
+            os.remove(DATABASE_UNDO)
+            self.__no_writeback = True
+            self.__msg("Undid last command.")
+        else:
+            raise BrainError('no undo file exists')
+
+    @special('verify')
+    def __special_verify(self):
+        problem = self.__integrity_check()
+        if problem is None:
+            self.__msg('Database is okay.')
+        else:
+            raise BrainError(problem)
+
+    #-------------------------------- EXECUTE --------------------------------#
+
+    def execute_command(self, command):
+        ckind, carg = command
+        if ckind == 'SPECIAL':
+            try:
+                f = SPECIAL_COMMANDS[carg]
+            except KeyError:
+                raise BrainError('unknown command (%s)' % carg)
+            f(self)
+        elif ckind == 'ADD':
+            self.__change_was_made = True
+            self.__add_task(carg)
+        elif ckind == 'SEARCH':
+            tasks = self.__search(carg)
+            numtasks = len(tasks)
+            self.__msg("Found %s match%s." %
+                       (numtasks, ('' if numtasks == 1 else 'es')))
+            self.__display = ['%s: %s' % (task.ticket, task.desc)
+                              for task in tasks]
+        elif ckind == 'QUERY':
+            ikind, iarg = carg
+            if ikind == 'STAR':
+                raise BrainError('cannot query *')
+            elif ikind == 'SEARCH':
+                tasks = self.__search(iarg)
+                detailed = (len(tasks) == 1)
+                self.__display = []
+                for task in tasks:
+                    if self.__display:
+                        self.__display.append('')
+                    self.__query_task(task, detailed)
+            elif ikind == 'ITEMS':
+                detailed = (len(iarg) == 1)
+                self.__display = []
+                for kind, arg in iarg:
+                    if self.__display:
+                        self.__display.append('')
+                    if kind == 'TICKET':
+                        self.__query_task(self.__get_task(arg), detailed)
+                    elif kind == 'CONTEXT':
+                        if arg is None:
+                            self.__query_context(None, detailed)
+                        else:
+                            context = self.__get_or_create_context(arg)
+                            self.__query_context(context, detailed)
+                            self.__clean_context(context)
+                    elif kind == 'DATE':
+                        day = self.__get_or_create_day(arg)
+                        self.__query_day(day, detailed)
+                        self.__clean_day(day)
+                    elif kind == 'INT':
+                        raise BrainError("cannot query a number (%i)" % arg)
+                    else: assert False, "bad item kind: %r" % kind
+        elif ckind == 'SHOW':
+            ikind, iarg = carg
+            if ikind == 'STAR':
+                raise BrainError('cannot show *')
+            elif ikind == 'SEARCH':
+                tasks = self.__search(iarg)
+                self.__display = []
+                for task in tasks:
+                    if self.__display:
+                        self.__display.append('')
+                    self.__show_task(task)
+            elif ikind == 'ITEMS':
+                self.__display = []
+                for kind, arg in iarg:
+                    if self.__display:
+                        self.__display.append('')
+                    if kind == 'TICKET':
+                        self.__show_task(self.__get_task(arg))
+                    elif kind == 'CONTEXT':
+                        if arg is None:
+                            self.__show_context(None)
+                        else:
+                            context = self.__get_or_create_context(arg)
+                            self.__show_context(context)
+                            self.__clean_context(context)
+                    elif kind == 'DATE':
+                        day = self.__get_or_create_day(arg)
+                        self.__show_day(day)
+                        self.__clean_day(day)
+                    elif kind == 'INT':
+                        raise BrainError("cannot show a number (%i)" % arg)
+                    else: assert False, "bad item kind: %r" % kind
+        elif ckind == 'DELETE':
+            self.__change_was_made = True
+            old_doable = frozenset(t for t in self.__tasks.itervalues() if
+                                   t.is_doable())
+            numtasks = numcontexts = 0
+            for kind, value in carg:
+                if kind == 'TICKET':
+                    task = self.__get_task(value)
+                    self.__delete_task(task)
+                    numtasks += 1
+                elif kind == 'CONTEXT':
+                    context = self.__get_or_create_context(value)
+                    self.__delete_context(context)
+                    numcontexts += 1
+                else: assert False, "bad item kind: %r" % kind
+            assert numtasks or numcontexts
+            newly_avail = frozenset(t for t in self.__tasks.itervalues() if
+                                    t.is_doable() and t not in old_doable)
+            num_avail = len(newly_avail)
+            if newly_avail:
+                self.__display = []
+                for task in newly_avail:
+                    self.__display_task(task, False)
+            self.__msg("Deleted %s%s%s.%s" %
+                       (("%i task%s" %
+                         (numtasks, ('' if numtasks == 1 else 's'))
+                         if numtasks else ''),
+                        (" and " if numtasks and numcontexts else ''),
+                        ("%i context%s" %
+                         (numcontexts,
+                          ('' if numcontexts == 1 else 's'))
+                         if numcontexts else ''),
+                        ("  %s task%s newly available." %
+                         (num_avail, ('' if num_avail == 1 else 's')) if
+                         newly_avail else '')))
+        elif ckind == 'ACTIONS':
+            self.__change_was_made = True
+            for akind, arg1, arg2 in carg:
+                if akind == 'DESCRIBE':
+                    for task in self.__get_tasks(arg1):
+                        self.__describe(task, arg2)
+                elif akind == 'DURATION':
+                    for task in self.__get_tasks(arg1):
+                        self.__duration(task, arg2)
+                elif akind == 'DUE':
+                    for task in self.__get_tasks(arg1):
+                        self.__due(task, arg2)
+                elif akind == 'START':
+                    for task in self.__get_tasks(arg1):
+                        self.__start(task, arg2)
+                elif akind == 'ONDATE':
+                    for task in self.__get_tasks(arg1):
+                        self.__on_date(task, arg2)
+                elif akind == 'DEPEND':
+                    tasks2 = self.__get_tasks(arg2)
+                    for task1 in self.__get_tasks(arg1):
+                        for task2 in tasks2:
+                            self.__depend(task1, task2)
+                elif akind == 'UNDEPEND':
+                    tasks2 = self.__get_tasks(arg2)
+                    for task1 in self.__get_tasks(arg1):
+                        for task2 in tasks2:
+                            self.__undepend(task1, task2)
+                elif akind == 'CONTEXTIFY':
+                    if len(arg2) > 1:
+                        raise BrainError("cannot put tasks in multiple"
+                                         " contexts")
+                    for task in self.__get_tasks(arg1):
+                        for cname in arg2:
+                            self.__contextify(task, cname)
+                elif akind == 'SUBCONTEXT':
+                    if None in arg2 or None in arg2:
+                        raise BrainError('bad argument: ^')
+                    for cname1 in arg1:
+                        for cname2 in arg2:
+                            self.__subcontext(cname1, cname2)
+                elif akind == 'UNSUBCONTEXT':
+                    if None in arg2 or None in arg2:
+                        raise BrainError('bad argument: ^')
+                    for cname1 in arg1:
+                        for cname2 in arg2:
+                            self.__unsubcontext(cname1, cname2)
+                else: assert False, "bad action kind: %r" % akind
+        else: assert False, "bad command kind: %r" % ckind
+
+    #-------------------------------- ACTIONS --------------------------------#
+
+    def __describe(self, task, string):
+        task.desc = string
+        self.__msg("Described task [%s]: %s" % (task.ticket, task.desc))
+
+    def __duration(self, task, n):
+        changed = (task.duration != n)
+        old_duration = task.duration
+        task.duration = n
+        self.__msg("Task [%s] %s %i day%s to complete%s." %
+                   (task.ticket,
+                    ("now requires" if changed else "already required"),
+                    task.duration, ('' if task.duration == 1 else 's'),
+                    (" instead of %i" % old_duration if changed else '')))
+
+    def __due(self, task, date):
+        changed = (task.due_date != date)
+        if changed:
+            if task.due_date is not None:
+                day = self.__days[task.due_date]
+                day.due.remove(task.ticket)
+                self.__clean_day(day)
+            task.due_date = date
+            if date is not None:
+                self.__get_or_create_day(date).due.add(task.ticket)
+        if date is None:
+            self.__msg("Task [%s] %s due date." %
+                       (task.ticket, ("no longer has a" if changed else
+                                      "already had no")))
+        else:
+            self.__msg("Task [%s] %s due on %s (%s)." %
+                       (task.ticket, ("is now" if changed else
+                                      "was already"), format_date(date),
+                        date_desc(date)))
+
+    def __start(self, task, date):
+        changed = (task.start_date != date)
+        if changed:
+            if task.start_date is not None:
+                day = self.__days[task.start_date]
+                day.start.remove(task.ticket)
+                self.__clean_day(day)
+            task.start_date = date
+            if date is not None:
+                self.__get_or_create_day(date).start.add(task.ticket)
+        if date is None:
+            self.__msg("Task [%s] %s start date." %
+                       (task.ticket,
+                        ("no longer has a" if changed else "already had no")))
+        else:
+            self.__msg("Task [%s] %s on %s (%s)." %
+                       (task.ticket,
+                        ("now starts" if changed else "already started"),
+                        format_date(date), date_desc(date)))
+
+    def __on_date(self, task, date):
+        self.__start(task, date)
+        self.__due(task, date)
+
+    def __depend(self, task1, task2):
+        changed = (task1.ticket in task2.depends_on)
+        if changed:
+            task2.depends_on.remove(task1.ticket)
+            task1.depended_by.remove(task2.ticket)
+            self.__msg("Task [%s] no longer depends on task [%s]." %
+                       (task2.ticket, task1.ticket))
+        changed = (task2.ticket not in task1.depends_on)
+        if changed:
+            task1.depends_on.add(task2.ticket)
+            task2.depended_by.add(task1.ticket)
+        # Check for a cycle.
+        visited = set()
+        stack = [(task1, None)]
+        while stack:
+            path = stack.pop()
+            for dep in path[0].depends_on:
+                if dep == task1.ticket:
+                    raise BrainError("dependency cycle (%s)" %
+                                     ', '.join(task.ticket for task in
+                                               linked_list_iter(path)))
+                if dep not in visited:
+                    visited.add(dep)
+                    stack.append((self.__tasks[dep], path))
+        self.__msg("Task [%s] %s task [%s]." %
+                   (task1.ticket, ("now depends on" if changed
+                                   else "already depended on"), task2.ticket))
+
+    def __undepend(self, task1, task2):
+        changed = (task1.ticket in task2.depends_on)
+        if changed:
+            task2.depends_on.remove(task1.ticket)
+            task1.depended_by.remove(task2.ticket)
+            self.__msg("Task [%s] no longer depends on task [%s]." %
+                       (task2.ticket, task1.ticket))
+        else:
+            changed = (task2.ticket in task1.depends_on)
+            if changed:
+                task1.depends_on.remove(task2.ticket)
+                task2.depended_by.remove(task1.ticket)
+            self.__msg("Task [%s] %s task [%s]." %
+                       (task1.ticket, ("no longer depends on" if changed
+                                       else "was already independent of"),
+                        task2.ticket))
+
+    def __contextify(self, task, cname):
+        old_cname = task.context
+        changed = (cname != old_cname)
+        if changed:
+            if old_cname is not None:
+                context = self.__contexts[old_cname]
+                context.tickets.remove(task.ticket)
+            task.context = cname
+            if cname is not None:
+                context = self.__get_or_create_context(cname)
+                context.tickets.add(task.ticket)
+        if cname is None:
+            self.__msg("Task [%s] %s." %
+                       (task.ticket,
+                        ("no longer requires context %s" % old_cname if
+                         changed else "already didn't require a context")))
+        else:
+            self.__msg("Task [%s] %s context %s%s." %
+                       (task.ticket, ("now requires" if changed
+                                      else "already required"), cname,
+                        (" instead of context %s" % old_cname if
+                         changed and old_cname is not None else "")))
+
+    def __subcontext(self, cname1, cname2):
+        context1 = self.__get_or_create_context(cname1)
+        context2 = self.__get_or_create_context(cname2)
+        changed = (cname1 in context2.subcontexts)
+        if changed:
+            context2.subcontexts.remove(cname1)
+            context1.supercontexts.remove(cname2)
+            self.__msg("%s is no longer a subcontext of %s." %
+                       (cname1, cname2))
+        changed = (cname2 not in context1.subcontexts)
+        if changed:
+            context1.subcontexts.add(cname2)
+            context2.supercontexts.add(cname1)
+        # Check for a cycle.
+        visited = set()
+        stack = [(context1, None)]
+        while stack:
+            path = stack.pop()
+            for sub in path[0].subcontexts:
+                if sub == cname1:
+                    raise BrainError("subcontext cycle (%s)" %
+                                     ', '.join(context.name for context in
+                                               linked_list_iter(path)))
+                if sub not in visited:
+                    visited.add(sub)
+                    stack.append((self.__contexts[sub], path))
+        self.__msg("%s %s a subcontext of %s." %
+                   (cname2, ("is now" if changed else "was already"), cname1))
+
+    def __unsubcontext(self, cname1, cname2):
+        context1 = self.__get_or_create_context(cname1)
+        context2 = self.__get_or_create_context(cname2)
+        changed = (cname2 in context1.subcontexts)
+        if changed:
+            context2.supercontexts.remove(cname1)
+            context1.subcontexts.remove(cname2)
+            self.__msg("%s is no longer a subcontext of %s." %
+                       (cname2, cname1))
+        else:
+            changed = (cname1 in context2.subcontexts)
+            if changed:
+                context1.supercontexts.remove(cname2)
+                context2.subcontexts.remove(cname1)
+            self.__msg("%s %s %s." %
+                       (cname1, ("is no longer a subcontext of" if changed
+                                 else "was already independent of"),
+                        cname2))
+        self.__clean_context(context1)
+        self.__clean_context(context2)
+
+    #--------------------------------- QUERY ---------------------------------#
+
+    def __query_task(self, task, detailed):
+        self.__display.append('\x1b[35m%s\x1b[m: %s' %
+                              (task.ticket, task.desc))
+        self.__display.append('%s / %s | %s # %d' %
+                              (format_date(task.start_date),
+                               format_date(task.due_date),
+                               ('^' if task.context is None else task.context),
+                               task.duration))
+        if detailed:
+            # Display prereqs (if any).
+            prereqs = frozenset(self.__get_prereqs((task,)))
+            assert task in prereqs
+            subprereqs = prereqs - frozenset((task,))
+            if subprereqs:
+                self.__display.append("\x1b[35mBefore doing task [%s],"
+                                      " you must:\x1b[m" % task.ticket)
+                for t in self.__topsort_tasks(subprereqs):
+                    self.__display_task(t, t.ticket in task.depends_on)
+            # Display tasks that aren't doable now, but that will be once this
+            # task and all its prereqs have been completed.
+            htickets = frozenset(t.ticket for t in prereqs)
+            today = datetime.date.today()
+            hdate = max(today if t.start_date is None else t.start_date for
+                        t in prereqs)
+            allowed = frozenset(t for t in self.__tasks.itervalues() if
+                                t not in prereqs and
+                                (t.due_date is None or t.due_date >= hdate) and
+                                not t.is_doable() and
+                                t.is_hypothetically_doable(htickets, hdate))
+            if allowed:
+                self.__display.append("\x1b[35mAfter doing task [%s],"
+                                      " you can:\x1b[m" % task.ticket)
+                for t in self.__topsort_tasks(allowed):
+                    self.__display_task(t, t.ticket in task.depended_by)
+            # Determine the latest possible start and completion dates for the
+            # task.
+            starts = dict((t, t.due_date - datetime.timedelta(t.duration))
+                          for t in self.__tasks.itervalues() if
+                          t.due_date is not None)
+            # BTW I'm pretty sure that BFS will be a little more efficient here
+            #     than DFS would be, so I'll use a queue instead of a stack.
+            # TODO Is there a more efficient way to do this?
+            queue = collections.deque(starts.iterkeys())
+            while queue:
+                next = queue.popleft()
+                start = starts[next]
+                for ticket in next.depends_on:
+                    other = self.__tasks[ticket]
+                    ostart = start - datetime.timedelta(other.duration)
+                    if other not in starts or ostart < starts[other]:
+                        starts[other] = ostart
+                        queue.append(other)
+            #start = starts.get(task, None)
+            #if start is not None:
+            #    self.__msg("Task [%s] should be started by %s (%s)." %
+            #               (task.ticket, format_date(start),
+            #                date_desc(start)))
+            ends = [starts[t] for t in
+                    (self.__tasks[ticket] for ticket in task.depended_by) if
+                    t in starts]
+            if task.due_date is not None:
+                ends.append(task.due_date)
+            end = (min(ends) if ends else None)
+            if end is not None:
+                self.__msg("Task [%s] should be completed by %s (%s)." %
+                           (task.ticket, format_date(end), date_desc(end)))
+
+    def __query_context(self, context, detailed):
+        # Show subcontexts and supercontexts.
+        if context is None:
+            chainstr = '\x1b[35m^\x1b[m'
+        else:
+            chainstr = '\x1b[35m%s\x1b[m' % context.name
+            if context.subcontexts:
+                chainstr += ' > ' + ' '.join(context.subcontexts)
+            top = context
+            while len(top.supercontexts) == 1:
+                nextname = iter(top.supercontexts).next()
+                chainstr = nextname + ' > ' + chainstr
+                top = self.__contexts[nextname]
+            if top.supercontexts:
+                chainstr = ' '.join(context.supercontexts) + ' > ' + chainstr
+        self.__display.append(chainstr)
+        # Show what tasks can currently be done in this context.
+        if detailed:
+            if context is None:
+                tasks = frozenset(task for task in self.__tasks.itervalues() if
+                                  task.is_doable() and task.context is None)
+                for task in self.__topsort_tasks(tasks):
+                    self.__display_task(task, True)
+            else:
+                all_subcontexts = set((context.name,))
+                queue = [context]
+                while queue:
+                    next = queue.pop()
+                    for sname in next.subcontexts:
+                        if sname not in all_subcontexts:
+                            all_subcontexts.add(sname)
+                            queue.append(self.__contexts[sname])
+                tasks = frozenset(task for task in self.__tasks.itervalues() if
+                                  task.is_doable() and
+                                  (task.context is None or
+                                   task.context in all_subcontexts))
+                for task in self.__topsort_tasks(tasks):
+                    self.__display_task(task, context.name == task.context)
+
+    def __query_day(self, day, detailed):
+        date = day.date
+        if detailed:
+            # Step 1: List the tasks that must be completed before the date.
+            due = frozenset(task for task in self.__tasks.itervalues() if
+                            task.due_date is not None and
+                            task.due_date <= date)
+            if due:
+                self.__display.append("\x1b[35mBefore %s, you must:\x1b[m" %
+                                      format_date(date))
+                for task in self.__topsort_tasks(self.__get_prereqs(due)):
+                    self.__display_task(task, task.due_date == date)
+            # Step 2: List the tasks that will be available after the date.
+            today = datetime.date.today()
+            start = frozenset(task for task in self.__tasks.itervalues() if
+                              task not in due and
+                              task.start_date is not None and
+                              today < task.start_date <= date)
+            if start:
+                self.__display.append("\x1b[35mAfter %s, you can:\x1b[m" %
+                                      format_date(date))
+                # FIXME Only include tasks that will have no prereqs on that
+                #       day (assuming all things due by that day get done).
+                for task in self.__topsort_tasks(start):
+                    self.__display_task(task, task.start_date == date)
+            # Step 3: Describe the date relative to today.
+            delta = (date - today).days
+            if delta == 0:
+                self.__msg("%s is today." % format_date(date))
+            elif delta == -1:
+                self.__msg("%s was yesterday." % format_date(date))
+            elif -1 > delta:
+                self.__msg("%s was %d days ago." % (format_date(date), -delta))
+            elif delta == 1:
+                self.__msg("%s is tomorrow." % format_date(date))
+            elif delta > 1:
+                self.__msg("%s is in %d days." % (format_date(date), delta))
+            else: assert False
+        else:
+            self.__display.append('\x1b[35m%s\x1b[m' % format_date(date))
+            if day.due:
+                self.__display.append('\ ' + ' '.join(day.due))
+            if day.start:
+                self.__display.append('/ ' + ' '.join(day.start))
+
+    #--------------------------------- SHOW ----------------------------------#
+
+    def __show_task(self, task):
+        self.__display.append("\x1b[35m%s\x1b[m: %s" %
+                              (task.ticket, task.desc))
+        self.__display.append("depends_on = {%s}" % ', '.join(task.depends_on))
+        self.__display.append("depended_by = {%s}" %
+                              ', '.join(task.depended_by))
+        self.__display.append("context = %s" %
+                              ('^' if task.context is None else task.context))
+        self.__display.append("due_date = %s" % format_date(task.due_date))
+        self.__display.append("start_date = %s" % format_date(task.start_date))
+        self.__display.append("duration = %i" % task.duration)
+
+    def __show_context(self, context):
+        if context is None:
+            self.__display.append("\x1b[35m^\x1b[m")
+            self.__display.append("tickets = {%s}" %
+                                  ', '.join(ticket for ticket, task in
+                                            self.__tasks.iteritems() if
+                                            task.context is None))
+        else:
+            self.__display.append("\x1b[35m%s\x1b[m" % context.name)
+            self.__display.append("tickets = {%s}" %
+                                  ', '.join(context.tickets))
+            self.__display.append("subcontexts = {%s}" %
+                                  ', '.join(context.subcontexts))
+            self.__display.append("supercontexts = {%s}" %
+                                  ', '.join(context.supercontexts))
+
+    def __show_day(self, day):
+        self.__display.append("\x1b[35m%s\x1b[m" % format_date(day.date))
+        self.__display.append("start = {%s}" % ', '.join(day.start))
+        self.__display.append("due = {%s}" % ', '.join(day.due))
+
+    #-------------------------------- SPECIAL --------------------------------#
+
+    def __display_task(self, task, hilight=False):
+        self.__display.append((' \x1b[31;1m%s\x1b[m: %s' if
+                               hilight == 'red' else
+                               ' \x1b[33m%s\x1b[m: %s' if
+                               hilight else ' %s: %s') %
+                              (task.ticket, task.desc))
+
+    def __topsort_tasks(self, tasks):
+        tasks = frozenset(tasks)
+        return [task for task in self.__topsort_all_tasks() if task in tasks]
+
+    def __topsort_all_tasks(self):
+        # Start with tasks that no one depends on.
+        queue = collections.deque(task for task in self.__tasks.itervalues() if
+                                  not task.depended_by)
+        # Invariant: a ticket is in the enqueued set iff that task has ever
+        # been in the queue.
+        enqueued = set(task.ticket for task in queue)
+        topsorted = collections.deque()
+        # Do a BFS over all tasks.
+        while queue:
+            task = queue.popleft()
+            assert task.ticket in enqueued
+            assert task.depended_by <= enqueued
+            topsorted.appendleft(task)
+            for ticket in task.depends_on:
+                other = self.__tasks[ticket]
+                if ticket not in enqueued and other.depended_by <= enqueued:
+                    enqueued.add(ticket)
+                    queue.append(other)
+        assert len(enqueued) == len(topsorted) == len(self.__tasks)
+        return topsorted
+
+    def __integrity_check(self):
+            for date, day in self.__days.iteritems():
+                if date != day.date:
+                    return ("day %s stored under key %s" %
+                            (format_date(day.date), format_date(date)))
+                for ticket in day.start:
+                    if ticket not in self.__tasks:
+                        return ("nonexistant task %s in start set for %s" %
+                                (ticket, format_date(date)))
+                    task = self.__tasks[ticket]
+                    if task.start_date != date:
+                        return ("task %s in start set for %s has start date %s"
+                                % (ticket, format_date(date),
+                                   format_date(task.start_date)))
+                for ticket in day.due:
+                    if ticket not in self.__tasks:
+                        return ("nonexistant task %s in due set for %s" %
+                                (ticket, format_date(date)))
+                    if self.__tasks[ticket].due_date != date:
+                        return "doom2!"
+            for name, context in self.__contexts.iteritems():
+                if name != context.name:
+                    return ("context %s stored under key %s" %
+                            (context.name, name))
+                for ticket in context.tickets:
+                    if ticket not in self.__tasks:
+                        return "doom3!"
+                    cname = self.__tasks[ticket].context
+                    if name != cname:
+                        return ("task %s in ticket set for %s has context %s" %
+                                (ticket, name,
+                                 ('^' if cname is None else cname)))
+                for other in context.subcontexts:
+                    if other not in self.__contexts:
+                        return "doom5!"
+                    if name not in self.__contexts[other].supercontexts:
+                        return "doom6!"
+                for other in context.supercontexts:
+                    if other not in self.__contexts:
+                        return "doom7!"
+                    if name not in self.__contexts[other].subcontexts:
+                        return "doom8!"
+            for ticket, task in self.__tasks.iteritems():
+                if ticket != task.ticket:
+                    return ("task %s stored under key %s" %
+                            (task.ticket, ticket))
+                for other in task.depends_on:
+                    if other not in self.__tasks:
+                        return "doom9!"
+                    if ticket not in self.__tasks[other].depended_by:
+                        return "doom10!"
+                for other in task.depended_by:
+                    if other not in self.__tasks:
+                        return "doom11!"
+                    if ticket not in self.__tasks[other].depends_on:
+                        return "doom12!"
+                if task.context is not None:
+                    if task.context not in self.__contexts:
+                        return "doom13!"
+                    if ticket not in self.__contexts[task.context].tickets:
+                        return "doom14!"
+                if task.start_date is not None:
+                    if task.start_date not in self.__days:
+                        return "doom15!"
+                    if ticket not in self.__days[task.start_date].start:
+                        return "doom16!"
+                if task.due_date is not None:
+                    if task.due_date not in self.__days:
+                        return "doom17!"
+                    if ticket not in self.__days[task.due_date].due:
+                        return "doom18!"
+
+    def __display_calendar(self, numdays):
+        # Step 1: Get latest possible start date for each task.
+        starts = dict((task, task.due_date - datetime.timedelta(task.duration))
+                      for task in self.__tasks.itervalues() if
+                      task.due_date is not None)
+        # BTW I'm pretty sure that BFS will be a little more efficient here
+        #     than DFS would be, so I'll use a queue instead of a stack.
+        queue = collections.deque(starts.iterkeys())
+        while queue:
+            task = queue.popleft()
+            start = starts[task]
+            for ticket in task.depends_on:
+                other = self.__tasks[ticket]
+                ostart = start - datetime.timedelta(other.duration)
+                if other not in starts or ostart < starts[other]:
+                    starts[other] = ostart
+                    queue.append(other)
+        # Step 2: Warn about tasks that start too late.
+        for task, start in starts.iteritems():
+            if task.start_date is not None and task.start_date > start:
+                self.__msg("Warning: task [%s] should start %s,"
+                           " but can't until %s." %
+                           (task.ticket, format_date(start),
+                            format_date(task.start_date)))
+        # Step 3: Collect tasks starting for the next `numdays` days.
+        today = datetime.date.today()
+        calendar_end_date = today + datetime.timedelta(numdays)
+        week = {}
+        for task in self.__topsort_tasks(starts.iterkeys()):
+            start = starts[task]
+            if start < calendar_end_date:
+                week.setdefault(max(start, today), []).append(task)
+        # Step 4: Build the display.
+        if self.__display is None: self.__display = []
+        for i in xrange(numdays):
+            date = today + datetime.timedelta(i)
+            tasks = week.get(date, ())
+            self.__display.append("\x1b[35m%s %s%s\x1b[m" %
+                                  (date.strftime('%a'), format_date(date),
+                                   (':' if tasks else '')))
+            for task in tasks:
+                self.__display_task(task, ('red' if task.due_date is not None
+                                           and task.due_date < date else
+                                           task.due_date == date))
+
+#=============================================================================#
+
+def _parse_date(string):
+    # Step 1: Get day.
+    daymatch = re.compile('[0-9]+').match(string)
+    day = int(daymatch.group())
+    # Step 2: Get month.
+    monthmatch = re.compile('[A-Za-z]+').match(string, daymatch.end())
+    monthstr = monthmatch.group().lower()
+    month = ['jan', 'feb', 'mar', 'apr', 'may', 'jun',
+             'jul', 'aug', 'sep', 'oct', 'nov', 'dec'].index(monthstr) + 1
+    # Step 3: Get year.
+    yearmatch = re.compile('[0-9]+').match(string, monthmatch.end())
+    if yearmatch:
+        yearstr = yearmatch.group()
+        if len(yearstr) == 4: year = int(yearstr)
+        elif len(yearstr) == 2:
+            thisyear = datetime.date.today().year
+            year = int(yearstr) + thisyear - (thisyear % 100)
+        else: raise ValueError
+        return datetime.date(year, month, day)
+    else:
+        today = datetime.date.today()
+        year = today.year
+        date = datetime.date(year, month, day)
+        if date < today:
+            return datetime.date(year + 1, month, day)
+        else: return date
+
+def _next_token(string, start):
+    match = re.compile(r'\s*').match(string, start)
+    if match: start = match.end()
+    if start == len(string):
+        return (None, None, start)
+    for symbol in "?!+<>-|:\\/~^*$#.":
+        if string[start] == symbol:
+            return (symbol, None, start + 1)
+    match = re.compile(r'[a-z][0-9a-z]*').match(string, start)
+    if match: return ('TICKET', match.group(), match.end())
+    match = re.compile(r'[A-Z][0-9A-Za-z_]*').match(string, start)
+    if match: return ('CONTEXT', match.group(), match.end())
+    match = re.compile(r'`([a-zA-Z0-9]+)').match(string, start)
+    if match:
+        name = match.group(1).lower()
+        if name.startswith('tod') and 'today'.startswith(name):
+            return ('DATE', datetime.date.today(), match.end())
+        if name.startswith('tom') and 'tomorrow'.startswith(name):
+            return ('DATE', datetime.date.today() + datetime.timedelta(1),
+                    match.end())
+        if name.startswith('yest') and 'yesterday'.startswith(name):
+            return ('DATE', datetime.date.today() - datetime.timedelta(1),
+                    match.end())
+        for short, full, n in [('mo', 'monday', 0),
+                               ('tu', 'tuesday', 1),
+                               ('we', 'wednesday', 2),
+                               ('th', 'thursday', 3),
+                               ('fr', 'friday', 4),
+                               ('sa', 'saturday', 5),
+                               ('su', 'sunday', 6)]:
+            if name.startswith(short) and full.startswith(name):
+                date = datetime.date.today()
+                while date.weekday() != n:
+                    date += datetime.timedelta(1)
+                return ('DATE', date, match.end())
+        return ('ERROR', "unknown special token (%s)" % name, match.end())
+    match = re.compile(r'[0-9]+[A-Za-z]+[0-9]*').match(string, start)
+    if match:
+        datestr = match.group()
+        try: date = _parse_date(datestr)
+        except ValueError:
+            return ('ERROR', "malformed date (%s)" % datestr, match.end())
+        else:
+            # WTF Apparently date.strftime only works on years >= 1900, so we
+            #     need to avoid such dates.
+            if date.year < 1900:
+                return ('ERROR', "year is too early (%s)" % datestr,
+                        match.end())
+            return ('DATE', date, match.end())
+    match = re.compile(r'[0-9]+').match(string, start)
+    if match: return ('INT', int(match.group()), match.end())
+    return ('ERROR', "lexical error at character %r" % string[start],
+            len(string))
+
+def _tokenize_command(string):
+    string = string.strip()
+    start = 0
+    tokens = []
+    while True:
+        (kind, value, start) = _next_token(string, start)
+        if kind is None: break
+        tokens.append((kind, value))
+        if kind in "+:$.":
+            tokens.append(('STR', string[start:].strip()))
+            break
+    return tokens
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - #
+
+def parse_command(string):
+    tokens = _tokenize_command(string)
+    for kind, value in tokens:
+        if kind == 'ERROR':
+            raise ParseError(value)
+    return _parse_cmd(collections.deque(tokens))
+
+def _parse_complete(tokens):
+    if tokens:
+        raise ParseError('expected end of input, but found %s' % tokens[0][0])
+
+def _parse_cmd(tokens):
+    if not tokens: return None
+    kind = tokens[0][0]
+    if kind == '?':
+        tokens.popleft()
+        items = _parse_items(tokens)
+        result = ('QUERY', items)
+    elif kind == '!':
+        tokens.popleft()
+        items = _parse_items(tokens)
+        result = ('SHOW', items)
+    elif kind == '~':
+        tokens.popleft()
+        items = []
+        while tokens:
+            kind = tokens[0][0]
+            if kind in ('CONTEXT', 'TICKET'):
+                items.append(tokens.popleft())
+            else: break
+        if not tokens:
+            raise ParseError('expected closing ~, but found nothing')
+        elif tokens[0][0] == '~':
+            tokens.popleft()
+        else:
+            raise ParseError('expected closing ~, but found %s' % tokens[0][0])
+        if not items:
+            raise ParseError('expected at least one item to delete')
+        result = ('DELETE', items)
+    elif kind == '$':
+        result = _parse_search(tokens)
+    elif kind == '+':
+        result = _parse_add(tokens)
+    elif kind == '.':
+        tokens.popleft()
+        result = ('SPECIAL', _parse_get_str(tokens))
+    else:
+        result = _parse_actions(tokens)
+    _parse_complete(tokens)
+    return result
+
+def _parse_search(tokens):
+    assert tokens and tokens[0][0] == '$'
+    tokens.popleft()
+    return ('SEARCH', _parse_get_str(tokens))
+
+def _parse_add(tokens):
+    assert tokens and tokens[0][0] == '+'
+    tokens.popleft()
+    return ('ADD', _parse_get_str(tokens))
+
+def _parse_get_str(tokens):
+    if not tokens:
+        raise ParseError('expected STR, but found nothing')
+    elif tokens[0][0] != 'STR':
+        raise ParseError('expected STR, but found %s' % tokens[0][0])
+    else: return tokens.popleft()[1]
+
+def _parse_items(tokens):
+    if not tokens:
+        raise ParseError('expected item list, but found nothing')
+    if tokens[0][0] == '*':
+        tokens.popleft()
+        return ('STAR', None)
+    if tokens[0][0] == '$':
+        return _parse_search(tokens)
+    items = []
+    while tokens:
+        kind = tokens[0][0]
+        if kind in ('CONTEXT', 'DATE', 'INT', 'TICKET'):
+            items.append(tokens.popleft())
+        elif kind == '^':
+            tokens.popleft()
+            items.append(('CONTEXT', None))
+        elif kind == '+':
+            items.append(_parse_add(tokens))
+        else: break
+    if not items:
+        raise ParseError('expected item list, but found %s' % tokens[0][0])
+    return ('ITEMS', items)
+
+def _parse_actions(tokens):
+    parts = [_parse_items(tokens)]
+    oprs = []
+    while tokens:
+        kind = tokens[0][0]
+        if kind in "<>-|/\\#":
+            tokens.popleft()
+            oprs.append(kind)
+        elif kind == ':':
+            tokens.popleft()
+            oprs.append(kind)
+            parts.append(('STR', _parse_get_str(tokens)))
+            continue
+        else: break
+        parts.append(_parse_items(tokens))
+    if not oprs:
+        raise ParseError('expected at least one operator')
+    assert len(parts) == 1 + len(oprs)
+    # Typechecking
+    actions = []
+    for i, opr in enumerate(oprs):
+        (left, right) = (parts[i], parts[i+1])
+        (ltype, left) = _parse_type(left)
+        (rtype, right) = _parse_type(right)
+        if opr == '/':
+            if ltype == 'DATE' and rtype == 'TASK':
+                actions.append(('START', right, left))
+            elif ltype == 'TASK' and rtype == 'DATE':
+                actions.append(('DUE', left, right))
+            else: raise ParseError('type mismatch (%s / %s)' % (ltype, rtype))
+        elif opr == '\\':
+            if ltype == 'DATE' and rtype == 'TASK':
+                actions.append(('DUE', right, left))
+            elif ltype == 'TASK' and rtype == 'DATE':
+                actions.append(('START', left, right))
+            else: raise ParseError('type mismatch (%s \\ %s)' % (ltype, rtype))
+        elif opr == '<':
+            if ltype == 'TASK' and rtype == 'TASK':
+                actions.append(('DEPEND', left, right))
+            elif ltype == 'CONTEXT' and rtype == 'CONTEXT':
+                actions.append(('SUBCONTEXT', right, left))
+            else: raise ParseError('type mismatch (%s < %s)' % (ltype, rtype))
+        elif opr == '>':
+            if ltype == 'TASK' and rtype == 'TASK':
+                actions.append(('DEPEND', right, left))
+            elif ltype == 'CONTEXT' and rtype == 'CONTEXT':
+                actions.append(('SUBCONTEXT', left, right))
+            else: raise ParseError('type mismatch (%s > %s)' % (ltype, rtype))
+        elif opr == '-':
+            if ltype == 'TASK' and rtype == 'TASK':
+                actions.append(('UNDEPEND', left, right))
+            elif ltype == 'CONTEXT' and rtype == 'CONTEXT':
+                actions.append(('UNSUBCONTEXT', left, right))
+            else: raise ParseError('type mismatch (%s - %s)' % (ltype, rtype))
+        elif opr == '|':
+            if ltype == 'TASK' and rtype == 'CONTEXT':
+                actions.append(('CONTEXTIFY', left, right))
+            elif ltype == 'CONTEXT' and rtype == 'TASK':
+                actions.append(('CONTEXTIFY', right, left))
+            elif ltype == 'TASK' and rtype == 'DATE':
+                actions.append(('ONDATE', left, right))
+            elif ltype == 'DATE' and rtype == 'TASK':
+                actions.append(('ONDATE', right, left))
+            else: raise ParseError('type mismatch (%s | %s)' % (ltype, rtype))
+        elif opr == '#':
+            if ltype == 'TASK' and rtype == 'INT':
+                actions.append(('DURATION', left, right))
+            elif ltype == 'INT' and rtype == 'TASK':
+                actions.append(('DURATION', right, left))
+            else: raise ParseError('type mismatch (%s # %s)' % (ltype, rtype))
+        elif opr == ':':
+            if ltype == 'TASK' and rtype == 'STR':
+                actions.append(('DESCRIBE', left, right))
+            else: raise ParseError('type mismatch (%s : %s)' % (ltype, rtype))
+        else: assert False, "bad operator: %r" % opr
+    return ('ACTIONS', actions)
+
+def _parse_type(part):
+    kind, arg = part
+    if kind == 'STR': return ('STR', arg)
+    elif kind == 'STAR': return ('DATE', None)
+    elif kind == 'SEARCH': return ('TASK', part)
+    elif kind == 'ITEMS':
+        if len(arg) == 1 and arg[0][0] == 'DATE':
+            return ('DATE', arg[0][1])
+        elif len(arg) == 1 and arg[0][0] == 'INT':
+            return ('INT', arg[0][1])
+        elif all(item[0] == 'CONTEXT' for item in arg):
+            return ('CONTEXT', [item[1] for item in arg])
+        elif all(item[0] in ('TICKET', 'ADD') for item in arg):
+            return ('TASK', part)
+        else: return ('MIXED', arg)
+    else: assert False, "bad part kind: %r" % kind
+
+#=============================================================================#
+
+if __name__ == '__main__':
+    if not os.path.isdir(DATABASE_DIR):
+        os.mkdir(DATABASE_DIR)
+    if os.path.isfile(DATABASE_DATA):
+        shutil.copyfile(DATABASE_DATA, DATABASE_BACKUP)
+    if os.path.isfile(DATABASE_UNDO):
+        os.remove(DATABASE_UNDO)
+    ConsoleHandler(Database()).run()
+
+#=============================================================================#
