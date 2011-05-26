@@ -22,6 +22,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import with_statement
 
+import calendar
 import collections
 import cPickle as pickle
 import datetime
@@ -1177,6 +1178,21 @@ def _parse_date(string):
     # Step 2: Get month.
     monthmatch = re.compile('[A-Za-z]+').match(string, daymatch.end())
     monthstr = monthmatch.group().lower()
+    if monthmatch.end() == len(string):
+        if monthstr in ('day', 'days'):
+            return datetime.date.today() + datetime.timedelta(day)
+        elif monthstr in ('week', 'weeks'):
+            return datetime.date.today() + datetime.timedelta(7 * day)
+        elif monthstr in ('month', 'months'):
+            today = datetime.date.today()
+            month = today.month + day
+            year = today.year + (month - 1) // 12
+            month = 1 + (month - 1) % 12
+            day_ = min(today.day, calendar.monthrange(year, month)[1])
+            return datetime.date(year, month, day_)
+        elif monthstr in ('year', 'years'):
+            today = datetime.date.today()
+            return datetime.date(today.year + day, today.month, today.day)
     month = ['jan', 'feb', 'mar', 'apr', 'may', 'jun',
              'jul', 'aug', 'sep', 'oct', 'nov', 'dec'].index(monthstr) + 1
     # Step 3: Get year.
