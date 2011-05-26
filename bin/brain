@@ -397,18 +397,25 @@ class DatabaseSession(object):
 
     @special('cal')
     def __special_cal(self):
+        """Display a one-week calandar of tasks."""
         self.__display_calendar(7)
 
     @special('cal2')
     def __special_cal2(self):
+        """Display a two-week calandar of tasks."""
         self.__display_calendar(14)
 
     @special('commands')
     def __special_commands(self):
-        self.__display = sorted(SPECIAL_COMMANDS.iterkeys())
+        """List all dot-commands."""
+        self.__display = sorted(
+            '.' + name +
+            ('' if fn.__doc__ is None else ' -- ' + fn.__doc__.split('\n')[0])
+            for (name, fn) in SPECIAL_COMMANDS.iteritems())
 
     @special('contexts')
     def __special_contexts(self):
+        """List all contexts, and how many available tasks are in each."""
         contexts = sorted(self.__contexts.iterkeys())
         self.__display = []
         for name, context in sorted(self.__contexts.iteritems()):
@@ -423,6 +430,7 @@ class DatabaseSession(object):
 
     @special('count')
     def __special_count(self):
+        """Display the number of tasks and contexts in the database."""
         numtasks = len(self.__tasks)
         numcontexts = len(self.__contexts)
         self.__msg("The database contains %i task%s and %i context%s."
@@ -431,11 +439,13 @@ class DatabaseSession(object):
 
     @special('days')
     def __special_days(self):
+        """List all dates that have a task starting or due that day."""
         self.__display = [format_date(date) for date in
                           sorted(self.__days.iterkeys())]
 
     @special('revert')
     def __special_revert(self):
+        """Undo all changes during this brain session."""
         if os.path.isfile(DATABASE_BACKUP):
             shutil.copyfile(DATABASE_BACKUP, DATABASE_DATA)
             self.__no_writeback = True
@@ -445,11 +455,13 @@ class DatabaseSession(object):
 
     @special('today', 'date')
     def __special_today(self):
+        """Display today's date."""
         self.__msg("Today's date is %s." %
                    format_date(datetime.date.today()))
 
     @special('undo')
     def __special_undo(self):
+        """Undo the last change to the database."""
         if os.path.isfile(DATABASE_UNDO):
             shutil.copyfile(DATABASE_UNDO, DATABASE_DATA)
             os.remove(DATABASE_UNDO)
@@ -460,6 +472,7 @@ class DatabaseSession(object):
 
     @special('verify')
     def __special_verify(self):
+        """Check for any consistency errors in the database."""
         problem = self.__integrity_check()
         if problem is None:
             self.__msg('Database is okay.')
